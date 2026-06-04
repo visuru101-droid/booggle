@@ -35,18 +35,33 @@ const BOGGLE_DICE = [
   "AFPKFS", "XLDERI", "HCPOAS", "ENSIEU",
   "YLDEVR", "ZNRNHL", "NMIQHU", "OBBAOJ"
 ];
+
 const PLAYER_ID_KEY = "poogglePlayerId";
 const PLAYER_NAME_KEY = "poogglePlayerName";
-const LAST_ROOM_KEY = "pooggleLastRoom";
 const THEME_KEY = "pooggleTheme";
-const channel = "BroadcastChannel" in window ? new BroadcastChannel("pooggle-room") : null;
+
+// Server URL — defaults to localhost:8081, or use config.js for production
+let SERVER_URL;
+if (typeof POOGGLE_SERVER_URL === "string" && POOGGLE_SERVER_URL) {
+  SERVER_URL = POOGGLE_SERVER_URL;
+} else {
+  const WS_PROTOCOL = window.location.protocol === "https:" ? "wss://" : "ws://";
+  const WS_HOST = window.location.hostname || "127.0.0.1";
+  SERVER_URL = `${WS_PROTOCOL}${WS_HOST}:8081`;
+}
+
 const LETTER_SCORES = {
   A: 1, B: 3, C: 3, D: 2, E: 1, F: 4, G: 2, H: 4, I: 1,
   J: 8, K: 5, L: 1, M: 3, N: 1, O: 1, P: 3, Q: 10, R: 1,
   S: 1, T: 1, U: 1, V: 4, W: 4, X: 8, Y: 4, Z: 10
 };
 
-let currentRoomCode = localStorage.getItem(LAST_ROOM_KEY) || "";
+// ── Server-authoritative room state (no localStorage for rooms) ──
+let serverRoom = null;
+let socket = null;
+let reconnectTimer = null;
+
+// Local game state
 let selected = [];
 let isDragging = false;
 let pointerPoint = null;
@@ -56,8 +71,6 @@ let tickId = null;
 let revealId = null;
 let revealComplete = false;
 let lastRevealSignature = "";
-let socket = null;
-let pendingJoin = null;
 
 // Initialize Theme
 const savedTheme = localStorage.getItem(THEME_KEY) || "scrabble";
@@ -77,27 +90,17 @@ function setTheme(theme) {
   }
 }
 
-// Initialize WebSockets
+// ── WebSocket Connection ────────────────────────────────────────
 function connectSocket() {
-  const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  // Use current hostname or default to localhost if opening local file
-  const host = window.location.hostname || "127.0.0.1";
-  const socketUrl = `${wsProtocol}//${host}:8081`;
-
-  socket = new WebSocket(socketUrl);
+  socket = new WebSocket(SERVER_URL);
 
   socket.addEventListener("open", () => {
     console.log("WebSocket connected");
-    if (currentRoomCode) {
-      if (!readRoom(currentRoomCode)) {
-        pendingJoin = {
-          code: currentRoomCode,
-          name: normalizeName(localStorage.getItem(PLAYER_NAME_KEY) || playerNameInput.value)
-        };
-      }
+    // Rejoin if we had a room
+    if (serverRoom) {
       socket.send(JSON.stringify({
         type: "join",
-        roomCode: currentRoomCode,
+        roomCode: serverRoom.code,
         playerId: playerId,
         playerName: localStorage.getItem(PLAYER_NAME_KEY) || ""
       }));
@@ -107,20 +110,26 @@ function connectSocket() {
   socket.addEventListener("message", (event) => {
     try {
       const data = JSON.parse(event.data);
-      if (data.type === "room-updated") {
-        if (pendingJoin && pendingJoin.code === data.room.code) {
-          addPlayerToRoom(data.room, pendingJoin.name);
-          pendingJoin = null;
-          return;
-        }
-        localStorage.setItem(roomKey(data.room.code), JSON.stringify(data.room));
-        render();
-      } else if (data.type === "room-missing" && pendingJoin && pendingJoin.code === data.roomCode) {
-        pendingJoin = null;
-        currentRoomCode = "";
-        localStorage.removeItem(LAST_ROOM_KEY);
-        alert("That room code was not found. Ask the host to create the room first.");
-        render();
+
+      switch (data.type) {
+        case "room-updated":
+          serverRoom = data.room;
+          render();
+          break;
+
+        case "room-missing":
+          console.warn(`Room ${data.roomCode} not found on server`);
+          showMessage("That room does not exist.", "error");
+          break;
+
+        case "room-full":
+          alert("This lobby already has eight players.");
+          break;
+
+        case "room-list":
+          // Debug: log available rooms
+          console.log("Available rooms:", data.rooms);
+          break;
       }
     } catch (err) {
       console.error("Error reading socket message:", err);
@@ -129,13 +138,16 @@ function connectSocket() {
 
   socket.addEventListener("close", () => {
     console.log("WebSocket closed. Reconnecting in 3s...");
-    setTimeout(connectSocket, 3000);
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(connectSocket, 3000);
+  });
+
+  socket.addEventListener("error", (err) => {
+    console.error(`WebSocket error: ${err}`);
   });
 }
 
-connectSocket();
-
-// Dictionary loaded asynchronously from words_dictionary.json
+// ── Dictionary loaded asynchronously ────────────────────────────
 let WORDS = null;
 let dictionaryReady = false;
 
@@ -143,67 +155,134 @@ let dictionaryReady = false;
   try {
     const response = await fetch("words_dictionary.json");
     const data = await response.json();
-    // Keys are lowercase; we'll look up lowercase words
     WORDS = data;
     dictionaryReady = true;
-    // Update any loading indicator
     const loadingEl = document.getElementById("dict-loading");
     if (loadingEl) loadingEl.remove();
   } catch (err) {
     console.error("Failed to load dictionary:", err);
-    // Fallback: allow all words longer than 3 letters
     WORDS = null;
     dictionaryReady = true;
   }
 })();
 
+// ── Player identity ─────────────────────────────────────────────
 const playerId = getOrCreatePlayerId();
 playerNameInput.value = localStorage.getItem(PLAYER_NAME_KEY) || "";
-roomCodeInput.value = currentRoomCode;
 
 function getOrCreatePlayerId() {
   const existing = sessionStorage.getItem(PLAYER_ID_KEY);
   if (existing) return existing;
-
   const id = crypto.randomUUID ? crypto.randomUUID() : `p-${Date.now()}-${Math.random()}`;
   sessionStorage.setItem(PLAYER_ID_KEY, id);
   return id;
 }
 
-function roomKey(code = currentRoomCode) {
-  return `pooggleRoom:${code}`;
+// ── Room operations (server-authoritative) ──────────────────────
+function sendToServer(data) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    console.warn("Socket not ready");
+    return false;
+  }
+  socket.send(JSON.stringify(data));
+  return true;
 }
 
+function createRoom() {
+  const code = freshCode();
+  const name = normalizeName(playerNameInput.value);
+  localStorage.setItem(PLAYER_NAME_KEY, name);
 
-
-function readRoom(code = currentRoomCode) {
-  if (!code) return null;
-
-  try {
-    return JSON.parse(localStorage.getItem(roomKey(code)));
-  } catch {
-    return null;
-  }
+  sendToServer({
+    type: "create-room",
+    roomCode: code,
+    playerId: playerId,
+    playerName: name,
+    board: null
+  });
 }
 
-function writeRoom(room) {
-  localStorage.setItem(roomKey(room.code), JSON.stringify(room));
-  if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({ type: "update", room }));
+function joinRoom() {
+  const name = normalizeName(playerNameInput.value);
+  const code = normalizeCode(roomCodeInput.value);
+
+  if (!code) return;
+
+  localStorage.setItem(PLAYER_NAME_KEY, name);
+
+  sendToServer({
+    type: "join",
+    roomCode: code,
+    playerId: playerId,
+    playerName: name
+  });
+}
+
+function updateRoom(room) {
+  sendToServer({ type: "update", room });
+}
+
+function leaveRoom() {
+  if (!serverRoom) return;
+
+  const room = { ...serverRoom };
+  room.players = room.players.filter((p) => p.id !== playerId);
+
+  // Transfer host if needed
+  if (room.hostId === playerId && room.players.length > 0) {
+    room.hostId = room.players[0].id;
   }
-  if (channel) {
-    channel.postMessage({ type: "room-updated", code: room.code });
-  }
+
+  updateRoom(room);
+  sendToServer({ type: "leave", roomCode: serverRoom.code });
+
+  serverRoom = null;
+  selected = [];
   render();
 }
 
+function startMatch() {
+  if (!serverRoom || serverRoom.hostId !== playerId) return;
+
+  const now = Date.now();
+  const room = { ...serverRoom };
+  room.status = "playing";
+  room.board = makeBoard();
+  room.startedAt = now;
+  room.endsAt = now + GAME_SECONDS * 1000;
+  room.nextMatchVotes = [];
+  room.players = room.players.map((p) => ({ ...p, words: [] }));
+
+  selected = [];
+  revealComplete = false;
+  lastRevealSignature = "";
+
+  updateRoom(room);
+}
+
+function backToLobby() {
+  if (!serverRoom) return;
+
+  const room = { ...serverRoom };
+  room.status = "lobby";
+  room.startedAt = null;
+  room.endsAt = null;
+  room.nextMatchVotes = [];
+  room.players = room.players.map((p) => ({ ...p, words: [] }));
+
+  revealComplete = false;
+  lastRevealSignature = "";
+
+  updateRoom(room);
+}
+
+// ── Helpers ─────────────────────────────────────────────────────
 function freshCode() {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   return Array.from({ length: 4 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join("");
 }
 
 function rollDice() {
-  // Fisher-Yates shuffle of the 16 dice, then pick one random face per die
   const dice = [...BOGGLE_DICE];
   for (let i = dice.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -211,7 +290,6 @@ function rollDice() {
   }
   return dice.map((die) => {
     const face = die[Math.floor(Math.random() * die.length)];
-    // Q is always paired with U on the same tile
     return face === "Q" ? "QU" : face;
   });
 }
@@ -234,141 +312,6 @@ function normalizeName(value) {
   return value.trim().slice(0, 18) || `Player ${Math.floor(Math.random() * 90) + 10}`;
 }
 
-function createRoom(code = freshCode()) {
-  const room = {
-    code,
-    hostId: playerId,
-    status: "lobby",
-    board: makeBoard(),
-    startedAt: null,
-    endsAt: null,
-    players: []
-  };
-  currentRoomCode = code;
-  roomCodeInput.value = code;
-  localStorage.setItem(LAST_ROOM_KEY, code);
-  writeRoom(room);
-  joinRoom();
-}
-
-function addPlayerToRoom(room, name) {
-  const existingIndex = room.players.findIndex((player) => player.id === playerId);
-  if (existingIndex === -1 && room.players.length >= MAX_PLAYERS) {
-    alert("This lobby already has eight players.");
-    return false;
-  }
-
-  const player = {
-    id: playerId,
-    name,
-    joinedAt: Date.now(),
-    words: []
-  };
-
-  if (existingIndex === -1) {
-    room.players.push(player);
-  } else {
-    room.players[existingIndex] = { ...room.players[existingIndex], name };
-  }
-
-  currentRoomCode = room.code;
-  roomCodeInput.value = room.code;
-  localStorage.setItem(PLAYER_NAME_KEY, name);
-  localStorage.setItem(LAST_ROOM_KEY, room.code);
-  writeRoom(room);
-  return true;
-}
-
-function joinRoom(event) {
-  if (event) event.preventDefault();
-
-  const name = normalizeName(playerNameInput.value);
-  const code = normalizeCode(roomCodeInput.value);
-  if (!code) return;
-
-  let room = readRoom(code);
-  if (!room) {
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      alert("Still connecting to the room server. Try joining again in a moment.");
-      return;
-    }
-    pendingJoin = { code, name };
-    currentRoomCode = code;
-    roomCodeInput.value = code;
-    localStorage.setItem(PLAYER_NAME_KEY, name);
-    localStorage.setItem(LAST_ROOM_KEY, code);
-    socket.send(JSON.stringify({
-      type: "join",
-      roomCode: code,
-      playerId: playerId,
-      playerName: name
-    }));
-    render();
-    return;
-  }
-
-  if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({
-      type: "join",
-      roomCode: code,
-      playerId: playerId,
-      playerName: name
-    }));
-  }
-
-  addPlayerToRoom(room, name);
-}
-
-function startMatch() {
-  const room = readRoom();
-  if (!room || room.hostId !== playerId) return;
-
-  const now = Date.now();
-  room.status = "playing";
-  room.board = makeBoard();
-  room.startedAt = now;
-  room.endsAt = now + GAME_SECONDS * 1000;
-  room.nextMatchVotes = [];
-  room.players = room.players.slice(0, MAX_PLAYERS).map((player) => ({ ...player, words: [] }));
-  selected = [];
-  revealComplete = false;
-  lastRevealSignature = "";
-  writeRoom(room);
-}
-
-function leaveRoom() {
-  const room = readRoom();
-  if (!room) return;
-
-  room.players = room.players.filter((player) => player.id !== playerId);
-  if (room.hostId === playerId && room.players[0]) {
-    room.hostId = room.players[0].id;
-  }
-  if (room.players.length === 0) {
-    localStorage.removeItem(roomKey());
-  } else {
-    writeRoom(room);
-  }
-  currentRoomCode = "";
-  localStorage.removeItem(LAST_ROOM_KEY);
-  selected = [];
-  render();
-}
-
-function backToLobby() {
-  const room = readRoom();
-  if (!room) return;
-
-  room.status = "lobby";
-  room.startedAt = null;
-  room.endsAt = null;
-  room.nextMatchVotes = [];
-  room.players = room.players.map((player) => ({ ...player, words: [] }));
-  revealComplete = false;
-  lastRevealSignature = "";
-  writeRoom(room);
-}
-
 function formatTime(msLeft) {
   const seconds = Math.max(0, Math.ceil(msLeft / 1000));
   const minutes = Math.floor(seconds / 60).toString().padStart(2, "0");
@@ -376,15 +319,38 @@ function formatTime(msLeft) {
   return `${minutes}:${remainder}`;
 }
 
-function setMessage(text, type = "") {
-  // No-op
+function showMessage(text, type) {
+  // Could add a toast/notification UI here
+  console.log(`${type}: ${text}`);
 }
 
+// ── Scoring ─────────────────────────────────────────────────────
+function getBaseWordPoints(word) {
+  return Math.max(1, word.length - 2);
+}
+
+function getWordScore(word, allWordsAcrossPlayers) {
+  const base = getBaseWordPoints(word);
+  const foundByCount = allWordsAcrossPlayers.filter((w) => w === word).length;
+  return foundByCount === 1 ? base * 2 : base;
+}
+
+function getLiveScore(words) {
+  return words.reduce((total, word) => total + getBaseWordPoints(word), 0);
+}
+
+function getFinalScore(myWords, room) {
+  const allWords = room.players.flatMap((p) => p.words);
+  return myWords.reduce((total, word) => total + getWordScore(word, allWords), 0);
+}
+
+// ── Rendering ───────────────────────────────────────────────────
 function render() {
-  const room = readRoom();
-  const inRoom = Boolean(room && currentRoomCode);
+  const room = serverRoom;
+  const inRoom = Boolean(room);
 
   roomPill.textContent = inRoom ? `Room ${room.code}` : "No room";
+
   lobbyView.hidden = inRoom && room.status !== "lobby";
   matchView.hidden = !inRoom || room.status !== "playing";
   resultsView.hidden = !inRoom || room.status !== "ended";
@@ -393,42 +359,21 @@ function render() {
     renderLobbyPlayers(null);
     startMatchButton.disabled = true;
     clearInterval(tickId);
+    tickId = null;
     return;
   }
 
   renderLobbyPlayers(room);
+
   if (room.status === "playing") {
     renderMatch(room);
   }
+
   if (room.status === "ended") {
     renderResults(room);
   }
 
   startMatchButton.disabled = room.hostId !== playerId || room.players.length === 0;
-}
-
-// ── Scoring ──────────────────────────────────────────────────────────────────
-// Base: 3 letters = 1pt, 4 = 2pt, 5 = 3pt … (word.length − 2)
-// Unique bonus: multiply by 2 if only one player found the word
-function getBaseWordPoints(word) {
-  return Math.max(1, word.length - 2);
-}
-
-function getWordScore(word, allWordsAcrossPlayers) {
-  const base = getBaseWordPoints(word);
-  const foundByCount = allWordsAcrossPlayers.filter((w) => w === word).length;
-  return foundByCount === 1 ? base * 2 : base; // unique ⇒ 2×
-}
-
-// Live score (during play — no uniqueness info yet)
-function getLiveScore(words) {
-  return words.reduce((total, word) => total + getBaseWordPoints(word), 0);
-}
-
-// Final score (after match — includes uniqueness bonus)
-function getFinalScore(myWords, room) {
-  const allWords = room.players.flatMap((p) => p.words);
-  return myWords.reduce((total, word) => total + getWordScore(word, allWords), 0);
 }
 
 function renderLobbyPlayers(room) {
@@ -451,23 +396,17 @@ function renderMatch(room) {
   renderMatchPlayers(room);
   updateTimer(room);
 
-  const me = room.players.find((player) => player.id === playerId);
+  const me = room.players.find((p) => p.id === playerId);
   if (scoreEl) {
     scoreEl.textContent = me ? getLiveScore(me.words) : 0;
   }
 
-  const playing = room.status === "playing";
-  document.querySelectorAll(".tile").forEach((tile) => {
-    tile.disabled = !playing;
-  });
-
-  if (playing && !tickId) {
+  if (!tickId) {
     tickId = setInterval(() => {
-      const latest = readRoom();
-      if (!latest) return;
-      updateTimer(latest);
-      if (Date.now() >= latest.endsAt) {
-        endMatch(latest);
+      if (!serverRoom || serverRoom.status !== "playing") return;
+      updateTimer(serverRoom);
+      if (Date.now() >= serverRoom.endsAt) {
+        endMatch();
       }
     }, 250);
   }
@@ -488,7 +427,6 @@ function renderBoard(room) {
     const tile = document.createElement("button");
     tile.className = "tile";
     tile.type = "button";
-    // Display Q as "Qu" (lowercase u) — internally stored as "QU"
     const displayLetter = cell.letter === "QU" ? "Qu" : cell.letter;
     const scoreLetter = cell.letter === "QU" ? "Q" : cell.letter;
     tile.innerHTML = `<span class="tile-letter"></span><span class="tile-score">${LETTER_SCORES[scoreLetter] || 1}</span>`;
@@ -500,6 +438,7 @@ function renderBoard(room) {
     tile.addEventListener("pointerenter", () => enterTile(cell.id));
     boardEl.append(tile);
   });
+
   syncSelectedTiles();
   updateCurrentWord(room);
   drawPath(room);
@@ -520,37 +459,40 @@ function updateTimer(room) {
   timerEl.textContent = room.status === "playing" ? formatTime(room.endsAt - Date.now()) : "00:00";
 }
 
-function endMatch(room) {
-  if (room.status !== "playing") return;
+// ── Match end ───────────────────────────────────────────────────
+function endMatch() {
+  if (!serverRoom || serverRoom.status !== "playing") return;
+
+  const room = { ...serverRoom };
   room.status = "ended";
+
   clearInterval(tickId);
   tickId = null;
   selected = [];
   pointerPoint = null;
+
   updateCurrentWord(room);
   drawPath(room);
-  setMessage("Time is up. Counting the room results.", "success");
-  writeRoom(room);
+  showMessage("Time is up. Counting the room results.", "success");
+
+  updateRoom(room);
 }
 
+// ── Board interaction ───────────────────────────────────────────
 function areAdjacent(first, second) {
   return Math.abs(first.row - second.row) <= 1 && Math.abs(first.col - second.col) <= 1;
 }
 
 function startDrag(id, event) {
-  const room = readRoom();
-  if (!room || room.status !== "playing") return;
+  if (!serverRoom || serverRoom.status !== "playing") return;
 
-  // Release implicit pointer capture so pointerenter/pointermove works on other tiles
+  // Release pointer capture so pointerenter works on other tiles
   if (event.target && typeof event.target.releasePointerCapture === "function") {
     try {
       event.target.releasePointerCapture(event.pointerId);
-    } catch (e) {
-      // Ignore errors if pointer capture is not supported or not active
-    }
+    } catch (e) {}
   }
 
-  // Cache all tile bounding rects for robust collision detection
   tileRects = Array.from(boardEl.querySelectorAll(".tile")).map((tile) => {
     const rect = tile.getBoundingClientRect();
     return {
@@ -567,7 +509,7 @@ function startDrag(id, event) {
   selected = [];
   pointerPoint = getLocalPoint(event);
   addTileToWord(id);
-  drawPath(room);
+  drawPath(serverRoom);
 }
 
 function dragAcross(event) {
@@ -580,11 +522,6 @@ function dragAcross(event) {
   const x = event.clientX;
   const y = event.clientY;
 
-  // Find the nearest tile center, then only activate it if the pointer is
-  // within a reduced hit radius (38% of tile width). This creates clear dead
-  // zones in the gaps so you can drag between tiles without accidentally
-  // triggering the wrong one. The adjacency check in addTileToWord still
-  // prevents impossible chain jumps.
   let nearestTile = null;
   let nearestDistSq = Infinity;
 
@@ -605,7 +542,7 @@ function dragAcross(event) {
     }
   }
 
-  drawPath(readRoom());
+  drawPath(serverRoom);
 }
 
 function enterTile(id) {
@@ -620,33 +557,28 @@ function stopDrag(event) {
   activePointerId = null;
   submitDraggedWord();
   pointerPoint = null;
-  drawPath(readRoom());
+  drawPath(serverRoom);
 }
 
 function addTileToWord(id) {
-  const room = readRoom();
-  if (!room || room.status !== "playing") return;
+  if (!serverRoom || serverRoom.status !== "playing") return;
 
-  const cell = room.board[id];
+  const cell = serverRoom.board[id];
   const existingIndex = selected.indexOf(id);
 
   if (selected.length > 0 && existingIndex === selected.length - 1) {
-    // Hovering the current last tile — nothing to do
     return;
   } else if (existingIndex !== -1) {
-    // Dragged back to a tile already in the chain: backtrack to that point.
-    // e.g. chain G-O-O dragged back to first O → chain becomes G-O
     selected = selected.slice(0, existingIndex + 1);
-  } else if (selected.length > 0 && !areAdjacent(room.board[selected[selected.length - 1]], cell)) {
-    // Non-adjacent tile — silently ignore during drag
+  } else if (selected.length > 0 && !areAdjacent(serverRoom.board[selected[selected.length - 1]], cell)) {
     return;
   } else {
     selected.push(id);
   }
 
-  updateCurrentWord(room);
+  updateCurrentWord(serverRoom);
   syncSelectedTiles();
-  drawPath(room);
+  drawPath(serverRoom);
 }
 
 function syncSelectedTiles() {
@@ -659,11 +591,14 @@ function syncSelectedTiles() {
 }
 
 function updateCurrentWord(room) {
-  const word = room && selected.length
-    ? selected.map((selectedId) => room.board[selectedId].letter).join("")
-    : "";
-  currentWordEl.textContent = word || "Drag across tiles";
-  currentWordEl.classList.toggle("is-building", Boolean(word));
+  if (!room || !selected.length) {
+    currentWordEl.textContent = "Drag across tiles";
+    currentWordEl.classList.remove("is-building");
+    return;
+  }
+  const word = selected.map((id) => room.board[id].letter).join("");
+  currentWordEl.textContent = word;
+  currentWordEl.classList.add("is-building");
 }
 
 function getLocalPoint(event) {
@@ -686,7 +621,7 @@ function getTileCenter(id) {
   };
 }
 
-function drawLine(start, end, className = "") {
+function drawLine(start, end, className) {
   const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
   line.setAttribute("x1", start.x);
   line.setAttribute("y1", start.y);
@@ -717,9 +652,9 @@ function clearSelection() {
   selected = [];
   pointerPoint = null;
   activePointerId = null;
-  updateCurrentWord(readRoom());
+  updateCurrentWord(serverRoom);
   syncSelectedTiles();
-  drawPath(readRoom());
+  drawPath(serverRoom);
 
   const wordBuildEl = document.querySelector(".word-build");
   if (wordBuildEl) {
@@ -731,16 +666,16 @@ function clearSelectionSoon(delay = 450) {
   window.setTimeout(clearSelection, delay);
 }
 
+// ── Word submission ─────────────────────────────────────────────
 function submitDraggedWord() {
-  const room = readRoom();
-  if (!room || room.status !== "playing") return;
+  if (!serverRoom || serverRoom.status !== "playing") return;
 
-  const word = selected.map((selectedId) => room.board[selectedId].letter).join("");
-  const me = room.players.find((player) => player.id === playerId);
+  const word = selected.map((id) => serverRoom.board[id].letter).join("");
+  const me = serverRoom.players.find((p) => p.id === playerId);
   const wordBuildEl = document.querySelector(".word-build");
 
   const handleFailure = (msg) => {
-    setMessage(msg, "error");
+    showMessage(msg, "error");
     if (wordBuildEl) {
       wordBuildEl.classList.add("is-invalid");
     }
@@ -751,27 +686,31 @@ function submitDraggedWord() {
     handleFailure("Join the room before submitting words.");
     return;
   }
+
   if (word.length < 3) {
     handleFailure("Words must be at least 3 letters.");
     return;
   }
+
   if (!dictionaryReady) {
     handleFailure("Dictionary is still loading, try again.");
     return;
   }
+
   if (me.words.includes(word)) {
     handleFailure("You already found that word!");
     return;
   }
-  // WORDS is the parsed JSON object; keys are lowercase
+
   if (WORDS && !WORDS[word.toLowerCase()]) {
     handleFailure(`"${word}" is not a valid word.`);
     return;
   }
 
+  // Add word to player's list and update server
   me.words.push(word);
-  writeRoom(room);
-  setMessage(`${word} added automatically.`, "success");
+  updateRoom(serverRoom);
+  showMessage(`${word} added automatically.`, "success");
 
   if (wordBuildEl) {
     wordBuildEl.classList.add("is-valid");
@@ -779,16 +718,14 @@ function submitDraggedWord() {
   clearSelectionSoon(400);
 }
 
-// ── Board-Word Solver ────────────────────────────────────────────────────────
-// Checks if `upperWord` can be traced as a valid path on the board.
-// Uses a bitmask (16 bits) for visited cells — fast for 4×4 boards.
+// ── Board-word solver ───────────────────────────────────────────
 function canFormOnBoard(upperWord, board) {
   function dfs(charPos, lastIdx, visitedMask) {
     if (charPos === upperWord.length) return true;
     for (let i = 0; i < board.length; i++) {
       if (visitedMask & (1 << i)) continue;
       if (lastIdx !== -1 && !areAdjacent(board[lastIdx], board[i])) continue;
-      const cellLetter = board[i].letter; // "A" or "QU"
+      const cellLetter = board[i].letter;
       if (upperWord.startsWith(cellLetter, charPos)) {
         if (dfs(charPos + cellLetter.length, i, visitedMask | (1 << i))) return true;
       }
@@ -798,20 +735,16 @@ function canFormOnBoard(upperWord, board) {
   return dfs(0, -1, 0);
 }
 
-// Finds the longest valid dictionary word formable on the given board.
-// Runs filter → sort → DFS check on top candidates.
 function findLongestBoardWord(board) {
   if (!WORDS) return null;
 
-  // Count each letter token available on the board
   const boardLetterCount = {};
   board.forEach((cell) => {
-    for (const ch of cell.letter) { // "QU" contributes Q and U
+    for (const ch of cell.letter) {
       boardLetterCount[ch] = (boardLetterCount[ch] || 0) + 1;
     }
   });
 
-  // Filter: keep only words whose letters are all present on the board
   const candidates = [];
   for (const word of Object.keys(WORDS)) {
     const len = word.length;
@@ -826,7 +759,6 @@ function findLongestBoardWord(board) {
     if (possible) candidates.push(word);
   }
 
-  // Sort longest-first, then check up to 600 candidates via DFS
   candidates.sort((a, b) => b.length - a.length);
   for (const word of candidates.slice(0, 600)) {
     if (canFormOnBoard(word.toUpperCase(), board)) return word.toUpperCase();
@@ -834,11 +766,11 @@ function findLongestBoardWord(board) {
   return null;
 }
 
+// ── Results rendering ───────────────────────────────────────────
 function renderResults(room) {
   clearInterval(tickId);
   tickId = null;
 
-  // ── Voting / auto-start ──
   const votes       = room.nextMatchVotes || [];
   const validVotes  = votes.filter((id) => room.players.some((p) => p.id === id));
   const voteCount   = validVotes.length;
@@ -859,41 +791,39 @@ function renderResults(room) {
       : `Next Match (${voteCount}/${totalPlayers} ready)`;
   }
 
-  // ── Build word frequency map for uniqueness bonus ──
+  // Build word frequency map for uniqueness bonus
   const allWords = room.players.flatMap((p) => p.words);
 
-  // ── Calculate final scores with uniqueness bonus ──
+  // Calculate final scores with uniqueness bonus
   const playerFinalScores = room.players.map((p) => getFinalScore(p.words, room));
   const maxScore = Math.max(1, ...playerFinalScores);
   const winnerIndex = playerFinalScores.indexOf(Math.max(...playerFinalScores));
   const winner = room.players[winnerIndex];
 
   winnerLine.textContent = maxScore > 1 || (winner && winner.words.length > 0)
-    ? `🏆 ${winner ? winner.name : "Nobody"} wins with ${Math.max(...playerFinalScores)} points!`
-    : "No points were scored this round.";
-  winnerLine.textContent = maxScore > 1 || (winner && winner.words.length > 0)
     ? `${winner ? winner.name : "Nobody"} wins with ${Math.max(...playerFinalScores)} points.`
     : "No points were scored this round.";
 
-  // ── Signature guard — skip rebuild if data unchanged ──
+  // Signature guard — skip rebuild if data unchanged
   const signature = JSON.stringify({
     board: room.board,
     players: room.players.map((p) => [p.id, p.words])
   });
+
   if (signature === lastRevealSignature) {
-    // Just update buttons
     if (revealComplete) {
       if (bestWordEl) bestWordEl.hidden = false;
       if (resultsActionsEl) resultsActionsEl.hidden = false;
     }
     return;
   }
+
   lastRevealSignature = signature;
   revealComplete = false;
   if (resultsActionsEl) resultsActionsEl.hidden = true;
   if (bestWordEl) bestWordEl.hidden = true;
 
-  // ── Build result cards (only real players) ──
+  // Build result cards
   clearInterval(revealId);
   resultsGrid.innerHTML = "";
 
@@ -943,16 +873,11 @@ function renderResults(room) {
       revealComplete = true;
       if (resultsActionsEl) resultsActionsEl.hidden = true;
 
-      // Async best-word search — runs after animation, result appears below buttons
+      // Async best-word search
       setTimeout(() => {
         if (!room.board) return;
         const best = findLongestBoardWord(room.board);
         if (bestWordEl) {
-          /*
-          bestWordEl.textContent = best
-            ? `🔤 Longest word on this board: ${best} (${best.length} letter${best.length !== 1 ? "s" : "})`
-            : "No long words found on this board.";
-          */
           bestWordEl.hidden = false;
           bestWordEl.textContent = best
             ? `Longest possible word on this board: ${best} (${best.length} letter${best.length !== 1 ? "s" : ""})`
@@ -964,42 +889,31 @@ function renderResults(room) {
   }, 420);
 }
 
+// ── Event listeners ─────────────────────────────────────────────
 createRoomButton.addEventListener("click", () => createRoom());
-lobbyForm.addEventListener("submit", joinRoom);
+lobbyForm.addEventListener("submit", (e) => { e.preventDefault(); joinRoom(); });
 startMatchButton.addEventListener("click", startMatch);
 leaveRoomButton.addEventListener("click", leaveRoom);
 rematchButton.addEventListener("click", backToLobby);
+
 nextMatchButton.addEventListener("click", () => {
-  const room = readRoom();
-  if (!room) return;
+  if (!serverRoom) return;
+  const room = { ...serverRoom };
   const votes = room.nextMatchVotes || [];
   if (!votes.includes(playerId)) {
     room.nextMatchVotes = [...votes, playerId];
-    writeRoom(room);
+    updateRoom(room);
   }
 });
+
 window.addEventListener("pointermove", dragAcross);
 window.addEventListener("pointerup", stopDrag);
 window.addEventListener("pointercancel", stopDrag);
+
 roomCodeInput.addEventListener("input", () => {
   roomCodeInput.value = normalizeCode(roomCodeInput.value);
 });
 
-window.addEventListener("storage", (event) => {
-  if (!currentRoomCode || event.key !== roomKey()) return;
-  render();
-});
-
-if (channel) {
-  channel.addEventListener("message", (event) => {
-    if (event.data.code === currentRoomCode) {
-      render();
-    }
-  });
-}
-
-if (currentRoomCode && readRoom(currentRoomCode)) {
-  render();
-} else {
-  render();
-}
+// ── Initialize connection ───────────────────────────────────────
+connectSocket();
+render();

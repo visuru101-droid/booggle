@@ -1,0 +1,12 @@
+services:
+  - type: websocket
+    name: pooggle-ws-server
+    envType: standard
+    region: north-america
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production

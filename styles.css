@@ -623,7 +623,6 @@ body.theme-scrabble .tile.is-selected {
 
 .result-card {
   flex: 1 1 200px;
-  min-height: 160px;
   display: grid;
   gap: 10px;
   align-content: start;
