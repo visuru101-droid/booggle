@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pooggle Multiplayer</title>
+  <meta name="description" content="Eight-player online Boggle word game with real dice, live scoring, and unique word bonuses.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="shell" aria-labelledby="app-title">
+    <header class="topbar">
+      <div>
+        <h1 id="app-title">Pooggle</h1>
+        <p>Eight-player word hunt</p>
+      </div>
+      <div class="header-right">
+        <span id="dict-loading" class="dict-loading-pill">LOADING DICTIONARY…</span>
+        <select id="theme-select" aria-label="Select color theme" class="theme-select">
+          <option value="emerald">Emerald</option>
+          <option value="cyberpunk">Cyberpunk</option>
+          <option value="ocean">Ocean</option>
+          <option value="sunset">Sunset</option>
+          <option value="scrabble">Scrabble</option>
+        </select>
+        <div class="room-pill" id="room-pill">No room</div>
+      </div>
+    </header>
+
+    <!-- ── LOBBY ── -->
+    <section class="panel lobby" id="lobby-view">
+      <div class="section-heading">
+        <h2>Lobby</h2>
+        <p>Share your room code with friends. Up to eight players can join.</p>
+      </div>
+
+      <form class="lobby-form" id="lobby-form">
+        <label>
+          Player name
+          <input id="player-name" type="text" maxlength="18" autocomplete="off" placeholder="Your name">
+        </label>
+        <label>
+          Room code
+          <input id="room-code" type="text" maxlength="8" autocomplete="off" placeholder="POOG">
+        </label>
+        <button type="submit">Join Lobby</button>
+      </form>
+
+      <div class="lobby-actions">
+        <button id="create-room" type="button">Create Room</button>
+        <button id="start-match" type="button" disabled>Start 90s Match</button>
+      </div>
+
+      <section class="players-grid" id="lobby-players" aria-label="Lobby players"></section>
+    </section>
+
+    <!-- ── MATCH ── -->
+    <section class="match" id="match-view" hidden>
+      <section class="hud">
+        <div class="metric">
+          <span>Score</span>
+          <strong id="score">0</strong>
+        </div>
+        <div class="metric">
+          <span>Time</span>
+          <strong id="timer">01:30</strong>
+        </div>
+        <button id="leave-room" type="button" class="btn-secondary">Leave</button>
+      </section>
+
+      <section class="word-build" aria-live="polite">
+        <span>Current Word</span>
+        <strong id="current-word">Drag across tiles</strong>
+      </section>
+
+      <section class="board-stage">
+        <svg class="path-lines" id="path-lines" aria-hidden="true"></svg>
+        <section class="board" id="board" aria-label="Boggle letter grid"></section>
+      </section>
+
+      <section class="players-strip" id="match-players" aria-label="Connected players"></section>
+    </section>
+
+    <!-- ── RESULTS ── -->
+    <section class="results" id="results-view" hidden>
+      <div class="section-heading">
+        <h2>Match Complete</h2>
+        <p id="winner-line">Counting every player&apos;s words.</p>
+      </div>
+
+      <section class="results-grid" id="results-grid" aria-label="Player results"></section>
+
+      <!-- Best word reveal — shown after scoring animation -->
+      <div id="best-word-line" class="best-word-line" hidden></div>
+
+      <!-- Buttons — shown after scoring animation finishes -->
+      <div id="results-actions" class="results-actions" hidden>
+        <button id="next-match" type="button">Next Match</button>
+        <button id="rematch" type="button" class="btn-secondary">Back to Lobby</button>
+      </div>
+    </section>
+  </main>
+
+  <script src="script.js"></script>
+</body>
+</html>
