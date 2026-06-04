@@ -27,6 +27,8 @@ wss.on("connection", (ws) => {
         const currentRoom = rooms.get(roomCode);
         if (currentRoom) {
           ws.send(JSON.stringify({ type: "room-updated", room: currentRoom }));
+        } else {
+          ws.send(JSON.stringify({ type: "room-missing", roomCode }));
         }
       } 
       

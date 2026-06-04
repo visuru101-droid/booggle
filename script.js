@@ -57,6 +57,7 @@ let revealId = null;
 let revealComplete = false;
 let lastRevealSignature = "";
 let socket = null;
+let pendingJoin = null;
 
 // Initialize Theme
 const savedTheme = localStorage.getItem(THEME_KEY) || "scrabble";
@@ -88,6 +89,12 @@ function connectSocket() {
   socket.addEventListener("open", () => {
     console.log("WebSocket connected");
     if (currentRoomCode) {
+      if (!readRoom(currentRoomCode)) {
+        pendingJoin = {
+          code: currentRoomCode,
+          name: normalizeName(localStorage.getItem(PLAYER_NAME_KEY) || playerNameInput.value)
+        };
+      }
       socket.send(JSON.stringify({
         type: "join",
         roomCode: currentRoomCode,
@@ -101,7 +108,18 @@ function connectSocket() {
     try {
       const data = JSON.parse(event.data);
       if (data.type === "room-updated") {
+        if (pendingJoin && pendingJoin.code === data.room.code) {
+          addPlayerToRoom(data.room, pendingJoin.name);
+          pendingJoin = null;
+          return;
+        }
         localStorage.setItem(roomKey(data.room.code), JSON.stringify(data.room));
+        render();
+      } else if (data.type === "room-missing" && pendingJoin && pendingJoin.code === data.roomCode) {
+        pendingJoin = null;
+        currentRoomCode = "";
+        localStorage.removeItem(LAST_ROOM_KEY);
+        alert("That room code was not found. Ask the host to create the room first.");
         render();
       }
     } catch (err) {
@@ -233,30 +251,11 @@ function createRoom(code = freshCode()) {
   joinRoom();
 }
 
-function joinRoom(event) {
-  if (event) event.preventDefault();
-
-  const name = normalizeName(playerNameInput.value);
-  const code = normalizeCode(roomCodeInput.value);
-  if (!code) return;
-
-  let room = readRoom(code);
-  if (!room) {
-    room = {
-      code,
-      hostId: playerId,
-      status: "lobby",
-      board: makeBoard(),
-      startedAt: null,
-      endsAt: null,
-      players: []
-    };
-  }
-
+function addPlayerToRoom(room, name) {
   const existingIndex = room.players.findIndex((player) => player.id === playerId);
   if (existingIndex === -1 && room.players.length >= MAX_PLAYERS) {
     alert("This lobby already has eight players.");
-    return;
+    return false;
   }
 
   const player = {
@@ -272,9 +271,41 @@ function joinRoom(event) {
     room.players[existingIndex] = { ...room.players[existingIndex], name };
   }
 
-  currentRoomCode = code;
+  currentRoomCode = room.code;
+  roomCodeInput.value = room.code;
   localStorage.setItem(PLAYER_NAME_KEY, name);
-  localStorage.setItem(LAST_ROOM_KEY, code);
+  localStorage.setItem(LAST_ROOM_KEY, room.code);
+  writeRoom(room);
+  return true;
+}
+
+function joinRoom(event) {
+  if (event) event.preventDefault();
+
+  const name = normalizeName(playerNameInput.value);
+  const code = normalizeCode(roomCodeInput.value);
+  if (!code) return;
+
+  let room = readRoom(code);
+  if (!room) {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      alert("Still connecting to the room server. Try joining again in a moment.");
+      return;
+    }
+    pendingJoin = { code, name };
+    currentRoomCode = code;
+    roomCodeInput.value = code;
+    localStorage.setItem(PLAYER_NAME_KEY, name);
+    localStorage.setItem(LAST_ROOM_KEY, code);
+    socket.send(JSON.stringify({
+      type: "join",
+      roomCode: code,
+      playerId: playerId,
+      playerName: name
+    }));
+    render();
+    return;
+  }
 
   if (socket && socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify({
@@ -285,7 +316,7 @@ function joinRoom(event) {
     }));
   }
 
-  writeRoom(room);
+  addPlayerToRoom(room, name);
 }
 
 function startMatch() {
