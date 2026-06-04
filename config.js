@@ -11,4 +11,4 @@
 //   Railway:       "wss://pooggle.railway.app"
 // ═══════════════════════════════════════════════════════
 
-const POOGGLE_SERVER_URL = "https://booggle.onrender.com/"; // Set to your server URL, or null for localhost
+const POOGGLE_SERVER_URL = null; // Set to your server URL, or null for localhost

@@ -481,7 +481,7 @@ label {
   width: min(100%, 430px);
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 10px;
+  gap: 15px;
   margin: 0 auto;
   touch-action: none;
   user-select: none;

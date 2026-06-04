@@ -149,19 +149,22 @@ function connectSocket() {
 
 // ── Dictionary loaded asynchronously ────────────────────────────
 let WORDS = null;
+let WORDS_SET = null;
 let dictionaryReady = false;
 
 (async function loadDictionary() {
   try {
-    const response = await fetch("words_dictionary.json");
+    const response = await fetch("dictionary.json");
     const data = await response.json();
     WORDS = data;
+    WORDS_SET = new Set(data.map((w) => w.toLowerCase()));
     dictionaryReady = true;
     const loadingEl = document.getElementById("dict-loading");
     if (loadingEl) loadingEl.remove();
   } catch (err) {
     console.error("Failed to load dictionary:", err);
     WORDS = null;
+    WORDS_SET = null;
     dictionaryReady = true;
   }
 })();
@@ -244,20 +247,14 @@ function leaveRoom() {
 function startMatch() {
   if (!serverRoom || serverRoom.hostId !== playerId) return;
 
-  const now = Date.now();
-  const room = { ...serverRoom };
-  room.status = "playing";
-  room.board = makeBoard();
-  room.startedAt = now;
-  room.endsAt = now + GAME_SECONDS * 1000;
-  room.nextMatchVotes = [];
-  room.players = room.players.map((p) => ({ ...p, words: [] }));
-
   selected = [];
   revealComplete = false;
   lastRevealSignature = "";
 
-  updateRoom(room);
+  sendToServer({
+    type: "start-match",
+    roomCode: serverRoom.code
+  });
 }
 
 function backToLobby() {
@@ -282,27 +279,6 @@ function freshCode() {
   return Array.from({ length: 4 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join("");
 }
 
-function rollDice() {
-  const dice = [...BOGGLE_DICE];
-  for (let i = dice.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [dice[i], dice[j]] = [dice[j], dice[i]];
-  }
-  return dice.map((die) => {
-    const face = die[Math.floor(Math.random() * die.length)];
-    return face === "Q" ? "QU" : face;
-  });
-}
-
-function makeBoard() {
-  const letters = rollDice();
-  return letters.map((letter, index) => ({
-    id: index,
-    letter,
-    row: Math.floor(index / BOARD_SIZE),
-    col: index % BOARD_SIZE
-  }));
-}
 
 function normalizeCode(value) {
   return value.trim().toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8);
@@ -430,7 +406,10 @@ function renderBoard(room) {
     const displayLetter = cell.letter === "QU" ? "Qu" : cell.letter;
     const scoreLetter = cell.letter === "QU" ? "Q" : cell.letter;
     tile.innerHTML = `<span class="tile-letter"></span><span class="tile-score">${LETTER_SCORES[scoreLetter] || 1}</span>`;
-    tile.querySelector(".tile-letter").textContent = displayLetter;
+    
+    const tileLetterEl = tile.querySelector(".tile-letter");
+    tileLetterEl.textContent = displayLetter;
+
     tile.dataset.id = cell.id;
     tile.dataset.letter = cell.letter;
     tile.setAttribute("aria-label", cell.letter === "QU" ? "Letter Qu" : `Letter ${cell.letter}`);
@@ -536,8 +515,9 @@ function dragAcross(event) {
   }
 
   if (nearestTile) {
-    const hitRadius = (nearestTile.right - nearestTile.left) * 0.26;
-    if (nearestDistSq <= hitRadius * hitRadius) {
+    const hitRadius = (nearestTile.right - nearestTile.left) * 0.45;
+    const isInside = x >= nearestTile.left && x <= nearestTile.right && y >= nearestTile.top && y <= nearestTile.bottom;
+    if (isInside || nearestDistSq <= hitRadius * hitRadius) {
       addTileToWord(nearestTile.id);
     }
   }
@@ -702,7 +682,7 @@ function submitDraggedWord() {
     return;
   }
 
-  if (WORDS && !WORDS[word.toLowerCase()]) {
+  if (WORDS_SET && !WORDS_SET.has(word.toLowerCase())) {
     handleFailure(`"${word}" is not a valid word.`);
     return;
   }
@@ -746,7 +726,7 @@ function findLongestBoardWord(board) {
   });
 
   const candidates = [];
-  for (const word of Object.keys(WORDS)) {
+  for (const word of WORDS) {
     const len = word.length;
     if (len < 3 || len > 16) continue;
     const upper = word.toUpperCase();
